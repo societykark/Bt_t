@@ -1,1 +1,1 @@
-worker: python osint_bot.py
+worker: python bot_idp.py
