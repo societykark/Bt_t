@@ -1,12 +1,9 @@
 import os
-import asyncio
-import json
 import logging
-import subprocess
+import requests
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
-import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -23,8 +20,7 @@ TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise ValueError("❌ La variable de entorno TOKEN no está configurada.")
 
-SHERLOCK_TIMEOUT = 120  # segundos
-CACHE_TTL = 300         # 5 minutos
+CACHE_TTL = 300
 MAX_RESULTS = 20
 
 # ========== LOGS ==========
@@ -34,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== CACHÉ EN MEMORIA ==========
+# ========== CACHÉ ==========
 cache: Dict[str, Dict] = {}
 
 def get_cache(key: str) -> Optional[Dict]:
@@ -54,9 +50,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🕵️ *Bot OSINT - Investigación en fuentes abiertas*\n\n"
         "Comandos disponibles:\n"
-        "🔍 `/search <usuario>` - Buscar usuario en redes sociales\n"
+        "🔍 `/search <usuario>` - Buscar usuario en redes sociales (WhatsMyName)\n"
         "🌐 `/ip <dirección>` - Geolocalizar una IP\n"
-        "📧 `/email <correo>` - Verificar brechas de datos\n"
+        "📧 `/email <correo>` - Verificar brechas de datos (emailrep.io)\n"
         "📱 `/phone <número>` - Buscar información de un teléfono\n"
         "🏛️ `/web <dominio>` - Obtener WHOIS de un dominio\n"
         "🗺️ `/map <ip>` - Mostrar ubicación en mapa\n"
@@ -85,7 +81,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode=ParseMode.MARKDOWN,
     )
 
-# ========== SEARCH (SHERLOCK) ==========
+# ========== SEARCH (WHATS MY NAME - API PÚBLICA) ==========
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -103,65 +99,55 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     status_msg = await update.message.reply_text(
-        f"🔍 Buscando `{username}` en redes sociales...\n⏳ Esto puede tomar hasta 2 minutos.",
+        f"🔍 Buscando `{username}` en redes sociales...\n⏳ Esto puede tomar unos segundos.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-        cmd = ["sherlock", username, "--output", "json", "--timeout", "10"]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=SHERLOCK_TIMEOUT)
-
-        if process.returncode != 0:
-            error_msg = stderr.decode().strip()
-            await status_msg.edit_text(f"❌ Error al ejecutar Sherlock:\n`{error_msg}`", parse_mode=ParseMode.MARKDOWN)
+        url = f"https://whatsmyname.app/api/v1/username/{username}"
+        response = requests.get(url, timeout=30)
+        
+        if response.status_code != 200:
+            await status_msg.edit_text(
+                f"❌ Error al consultar WhatsMyName: Código {response.status_code}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
             return
 
-        result = json.loads(stdout.decode())
-        if not result or username not in result:
+        data = response.json()
+        if not data.get("sites") or len(data["sites"]) == 0:
             await status_msg.edit_text(f"❌ No se encontró el usuario `{username}` en ninguna red social.", parse_mode=ParseMode.MARKDOWN)
             return
 
-        data = result[username]
-        if not data:
-            await status_msg.edit_text(f"❌ No hay datos para `{username}`.", parse_mode=ParseMode.MARKDOWN)
+        sites = [site for site in data["sites"] if site.get("username_found", False)]
+        if not sites:
+            await status_msg.edit_text(f"❌ No se encontró el usuario `{username}` en ninguna red social.", parse_mode=ParseMode.MARKDOWN)
             return
 
-        # Filtrar y ordenar
-        plataformas_prioritarias = ["Facebook", "Twitter", "Instagram", "GitHub", "Reddit", "YouTube", "TikTok", "LinkedIn"]
-        sorted_data = sorted(data.items(), key=lambda x: (x[0] not in plataformas_prioritarias, x[0]))
+        sites.sort(key=lambda x: x.get("name", "").lower())
 
         resultado_texto = ""
         count = 0
-        for plataforma, url in sorted_data:
+        for site in sites:
             if count >= MAX_RESULTS:
                 break
-            if url:
-                resultado_texto += f"• [{plataforma}]({url})\n"
-                count += 1
-
-        if not resultado_texto:
-            await status_msg.edit_text(f"❌ No se encontraron redes para `{username}`.", parse_mode=ParseMode.MARKDOWN)
-            return
+            name = site.get("name", "Desconocido")
+            uri = site.get("uri", "")
+            if uri:
+                resultado_texto += f"• [{name}]({uri})\n"
+            else:
+                resultado_texto += f"• {name}\n"
+            count += 1
 
         final_text = f"🔍 *Resultados para `{username}`:*\n\n{resultado_texto}"
-        if len(sorted_data) > MAX_RESULTS:
-            final_text += f"\n*...y {len(sorted_data) - MAX_RESULTS} redes más.*"
+        if len(sites) > MAX_RESULTS:
+            final_text += f"\n*...y {len(sites) - MAX_RESULTS} redes más.*"
 
         set_cache(cache_key, final_text)
         await status_msg.edit_text(final_text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
-    except asyncio.TimeoutError:
-        await status_msg.edit_text(
-            f"❌ La búsqueda tomó más de {SHERLOCK_TIMEOUT} segundos. Intenta con un usuario más corto.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except json.JSONDecodeError:
-        await status_msg.edit_text("❌ Error al procesar los resultados de Sherlock.", parse_mode=ParseMode.MARKDOWN)
+    except requests.exceptions.Timeout:
+        await status_msg.edit_text("❌ La búsqueda tomó demasiado tiempo. Intenta más tarde.", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Error en search: {e}")
         await status_msg.edit_text(f"❌ Error inesperado: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
@@ -210,13 +196,11 @@ async def ip_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         set_cache(cache_key, resultado)
         await status_msg.edit_text(resultado, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
-    except requests.exceptions.RequestException:
-        await status_msg.edit_text("❌ Error al conectar con el servicio de geolocalización.", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Error en ip_info: {e}")
         await status_msg.edit_text(f"❌ Error inesperado: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
 
-# ========== EMAIL (Have I Been Pwned) ==========
+# ========== EMAIL (EMAILREP.IO - SIN API KEY) ==========
 
 async def email_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -230,38 +214,59 @@ async def email_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"📧 *Resultados para `{email}` (desde caché):*\n\n{cached}", parse_mode=ParseMode.MARKDOWN)
         return
 
-    status_msg = await update.message.reply_text(f"📧 Verificando `{email}` en brechas de datos...", parse_mode=ParseMode.MARKDOWN)
+    status_msg = await update.message.reply_text(f"📧 Verificando `{email}` en bases de datos...", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        response = requests.get(f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}", headers={"hibp-api-key": ""})
-        
+        url = f"https://emailrep.io/{email}"
+        response = requests.get(url, timeout=30)
+
         if response.status_code == 404:
-            await status_msg.edit_text(f"✅ ¡El correo `{email}` no apareció en ninguna brecha de datos conocida!", parse_mode=ParseMode.MARKDOWN)
-            set_cache(cache_key, "✅ No se encontraron brechas.")
-            return
-        
-        if response.status_code == 429:
-            await status_msg.edit_text("⏳ Demasiadas peticiones. Espera un momento y vuelve a intentar.", parse_mode=ParseMode.MARKDOWN)
-            return
-        
-        if response.status_code != 200:
-            await status_msg.edit_text(f"❌ Error al consultar HIBP: Código {response.status_code}", parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(f"✅ No se encontró información sobre `{email}` en las bases de datos públicas.", parse_mode=ParseMode.MARKDOWN)
+            set_cache(cache_key, "✅ Sin información pública.")
             return
 
-        breaches = response.json()
-        resultado = f"🚨 *El correo `{email}` fue comprometido en {len(breaches)} brecha(s):*\n\n"
-        for breach in breaches[:10]:
-            resultado += f"• *{breach.get('Name', 'Desconocido')}* ({breach.get('BreachDate', 'Fecha desconocida')})\n"
-            if breach.get('Description'):
-                resultado += f"  _{breach['Description'][:200]}..._\n"
-        if len(breaches) > 10:
-            resultado += f"\n*...y {len(breaches) - 10} brechas más.*"
+        if response.status_code == 429:
+            await status_msg.edit_text("⏳ Demasiadas peticiones. Espera un momento.", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        if response.status_code != 200:
+            await status_msg.edit_text(f"❌ Error al consultar emailrep.io: Código {response.status_code}", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        data = response.json()
+        
+        reputation = data.get("reputation", "N/A")
+        suspicious = data.get("suspicious", False)
+        references = data.get("references", 0)
+        details = data.get("details", {})
+
+        resultado = f"📧 *Información sobre `{email}`:*\n\n"
+        resultado += f"• *Reputación:* {reputation}\n"
+        resultado += f"• *Sospechoso:* {'Sí' if suspicious else 'No'}\n"
+        resultado += f"• *Referencias en internet:* {references}\n"
+
+        if details:
+            if details.get("email_provider"):
+                resultado += f"• *Proveedor de email:* {details['email_provider']}\n"
+            if details.get("domain_exists"):
+                resultado += f"• *Dominio existe:* {'Sí' if details['domain_exists'] else 'No'}\n"
+            if details.get("valid_mx"):
+                resultado += f"• *MX válido:* {'Sí' if details['valid_mx'] else 'No'}\n"
+            if details.get("free_provider"):
+                resultado += f"• *Proveedor gratuito:* {'Sí' if details['free_provider'] else 'No'}\n"
+            if details.get("leaked"):
+                resultado += f"• *Filtrado en brechas:* {'Sí' if details['leaked'] else 'No'}\n"
+
+        if data.get("breaches"):
+            resultado += "\n🚨 *Brechas encontradas:*\n"
+            for breach in data["breaches"][:5]:
+                resultado += f"• {breach}\n"
+            if len(data["breaches"]) > 5:
+                resultado += f"*...y {len(data['breaches']) - 5} más.*\n"
 
         set_cache(cache_key, resultado)
         await status_msg.edit_text(resultado, parse_mode=ParseMode.MARKDOWN)
 
-    except requests.exceptions.RequestException:
-        await status_msg.edit_text("❌ Error al conectar con el servicio HIBP.", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Error en email_check: {e}")
         await status_msg.edit_text(f"❌ Error inesperado: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
@@ -282,17 +287,12 @@ async def phone_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     status_msg = await update.message.reply_text(f"📱 Consultando información de `{phone}`...", parse_mode=ParseMode.MARKDOWN)
 
-    # Como numverify requiere API key, usamos una API pública gratuita (ejemplo)
-    # Puedes reemplazar esto con numverify si tienes clave
     try:
-        response = requests.get(f"http://apilayer.net/api/validate?access_key=&number={phone}")
-        # Nota: Necesitas una API key de numverify (gratis hasta 100/mes)
-        # Por ahora mostramos un mensaje informativo
         await status_msg.edit_text(
             "📱 *Funcionalidad en desarrollo*\n\n"
             "Para usar `/phone`, necesitas una API key de numverify.com (gratis).\n"
-            "Mientras tanto, puedes buscar el número en Google o en sitios como `https://www.veriphone.io/`.",
-            parse_mode=ParseMode.MARKDOWN
+            "Mientras tanto, puedes buscar el número en Google.",
+            parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
         logger.error(f"Error en phone_lookup: {e}")
@@ -317,7 +317,14 @@ async def whois_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         import whois
         w = whois.whois(domain)
-        
+
+        if not w.name and not w.org and not w.emails:
+            await status_msg.edit_text(
+                f"❌ No se encontró información WHOIS para `{domain}`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
         resultado = f"🏛️ *WHOIS de `{domain}`:*\n\n"
         resultado += f"• *Registrante:* {w.name if w.name else 'N/A'}\n"
         resultado += f"• *Organización:* {w.org if w.org else 'N/A'}\n"
@@ -333,10 +340,16 @@ async def whois_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await status_msg.edit_text(resultado, parse_mode=ParseMode.MARKDOWN)
 
     except ImportError:
-        await status_msg.edit_text("❌ La librería `whois` no está instalada. Agrega `python-whois` a requirements.txt.", parse_mode=ParseMode.MARKDOWN)
+        await status_msg.edit_text("❌ La librería `whois` no está instalada.", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Error en whois_lookup: {e}")
-        await status_msg.edit_text(f"❌ Error al obtener WHOIS: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
+        if "No match for" in str(e):
+            await status_msg.edit_text(
+                f"❌ El dominio `{domain}` no tiene registro WHOIS público.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await status_msg.edit_text(f"❌ Error al obtener WHOIS: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
 
 # ========== MAP ==========
 
@@ -363,7 +376,7 @@ async def map_ip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ========== UNKNOWN COMMAND ==========
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("❌ Comando no reconocido. Usa `/menu` para ver las opciones disponibles.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("❌ Comando no reconocido. Usa `/menu`.", parse_mode=ParseMode.MARKDOWN)
 
 # ========== MAIN ==========
 
